@@ -48,6 +48,15 @@ import           QuorumTools.Util           (HexPrefix (..), bytes20P,
                                              printHex, tee, textDecode,
                                              textEncode)
 
+-- TODO:
+-- [x] add base raft port to ClusterEnv
+-- [x] add gethRaftPort to Geth
+-- [x] supply raft port on CLI when we start geth
+-- [~] add raft ports to static nodes json
+--       this will be automatic; requires:
+-- [ ] append raftport=... to enode ID after requesting it via requestEnodeId
+-- [ ] supply raft port when calling raft.addPeer(enode)
+
 emptyClusterEnv :: ClusterEnv
 emptyClusterEnv = ClusterEnv
   { _clusterPassword              = CleartextPassword "abcd"
@@ -62,7 +71,7 @@ emptyClusterEnv = ClusterEnv
   , _clusterConstellationConfs    = Map.empty
   , _clusterAccountKeys           = Map.empty
   , _clusterInitialMembers        = Set.empty
-  , _clusterConsensus             = Raft
+  , _clusterConsensus             = Raft 50400
   , _clusterPrivacySupport        = PrivacyDisabled
   }
 
@@ -101,6 +110,10 @@ httpPort (GethId gid) = (fromIntegral gid +) <$> view clusterBaseHttpPort
 
 rpcPort :: HasEnv m => GethId -> m Port
 rpcPort (GethId gid) = (fromIntegral gid +) <$> view clusterBaseRpcPort
+
+-- raftPort :: HasEnv m => GethId -> m (Maybe Port)
+-- raftPort (GethId gid) = fmap (fromIntegral gid +) . getFirst
+--                     <$> view (clusterConsensus.raftBasePort.to (First . Just))
 
 constellationPort :: HasEnv m => GethId -> m Port
 constellationPort (GethId gid) =
@@ -147,9 +160,11 @@ gethCommand geth more = format (s%" geth --datadir "%fp                    %
 
     consensusOptions :: Text
     consensusOptions = case gethConsensusPeer geth of
-      RaftPeer -> case gethJoinMode geth of
-        JoinExisting   -> format ("--raft --raftjoinexisting "%d) (gId $ gethId geth)
-        JoinNewCluster -> "--raft"
+      RaftPeer raftPort -> case gethJoinMode geth of
+        JoinExisting -> format ("--raft --raftjoinexisting "%d%" --raftport "%d)
+                               (gId $ gethId geth)
+                               raftPort
+        JoinNewCluster -> format ("--raft --raftport "%d) raftPort
       QuorumChainPeer acctId mRole -> case mRole of
         Nothing -> ""
         Just BlockMaker ->
@@ -242,7 +257,7 @@ gidIp gid = force . Map.lookup gid <$> view clusterIps
     force = fromMaybe $ error $ "no IP found for " <> show gid
 
 -- | We need to use the RPC interface to get the EnodeId if we haven't yet
--- started up geth.
+-- started up geth, or if the node is not in the static peers list.
 requestEnodeId :: (MonadIO m, HasEnv m) => GethId -> m EnodeId
 requestEnodeId gid = do
   mkCmd <- setupCommand gid
@@ -264,7 +279,7 @@ requestEnodeId gid = do
     forceNodeId = fromMaybe $ error "unable to extract enode ID"
 
 mkConsensusPeer :: GethId -> AccountId -> Consensus -> ConsensusPeer
-mkConsensusPeer _   _   Raft = RaftPeer
+mkConsensusPeer gid _   (Raft basePort) = RaftPeer $ basePort + fromIntegral (gId gid)
 mkConsensusPeer gid aid (QuorumChain bmGid voterGids) =
   QuorumChainPeer aid $ if | gid == bmGid ->           Just BlockMaker
                            | gid `member` voterGids -> Just Voter
@@ -315,6 +330,10 @@ createNode genesisJsonPath gid = do
     cEnv <- ask
     let acctKey = forceAcctKey $ cEnv ^? clusterAccountKeys . ix gid
     installAccountKey gid acctKey
+    --
+    -- TODO: this needs to be augmented with raftport=....
+    --    so that on the geth side the initial nodes can know each other raft port
+    --
     eid <- requestEnodeId gid
     mkGeth gid eid
 
@@ -343,8 +362,9 @@ readStaticNodes (DataDir ddPath) = force . textDecode <$> strict (input path)
     path = ddPath </> "static-nodes.json"
     force = fromMaybe $ error "failed to load enodes from static-nodes.json"
 
--- | If we've already started up geth in the past, we don't need to use RPC
--- interface to get the EnodeId; we can read it directly from the datadir.
+-- | If we've already started up geth in the past, and the node is in the
+-- initial/static peers list, we don't need to use RPC interface to get the
+-- EnodeId; we can read it directly from the datadir.
 readEnodeId :: (HasEnv m, MonadIO m) => GethId -> m EnodeId
 readEnodeId gid = do
     nodeDataDir <- gidDataDir gid
